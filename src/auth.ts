@@ -4,6 +4,8 @@ import { OAuth2Client } from 'google-auth-library';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as readline from 'readline/promises';
+import { createServer } from 'http';
+import { AddressInfo } from 'net';
 import { fileURLToPath } from 'url';
 
 // --- Calculate paths relative to this script file (ESM way) ---
@@ -60,17 +62,23 @@ async function saveCredentials(client: OAuth2Client): Promise<void> {
 
 async function authenticate(): Promise<OAuth2Client> {
   const { client_secret, client_id, redirect_uris, client_type } = await loadClientSecrets();
-  // For web clients, use the configured redirect URI; for desktop clients, use 'urn:ietf:wg:oauth:2.0:oob'
-  const redirectUri = client_type === 'web' ? redirect_uris[0] : 'urn:ietf:wg:oauth:2.0:oob';
-  console.error(`DEBUG: Using redirect URI: ${redirectUri}`);
   console.error(`DEBUG: Client type: ${client_type}`);
-  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
+  if (client_type === 'installed') {
+    return authenticateWithLoopback(client_id, client_secret);
+  }
 
+  const redirectUri = redirect_uris[0];
+  console.error(`DEBUG: Using redirect URI: ${redirectUri}`);
+  return authenticateWithManualCode(client_id, client_secret, redirectUri);
+}
+
+async function authenticateWithManualCode(clientId: string, clientSecret: string, redirectUri: string): Promise<OAuth2Client> {
+  const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
   const authorizeUrl = oAuth2Client.generateAuthUrl({
     access_type: 'offline',
-    scope: SCOPES.join(' '),
+    scope: SCOPES,
   });
 
   console.error('DEBUG: Generated auth URL:', authorizeUrl);
@@ -81,10 +89,117 @@ async function authenticate(): Promise<OAuth2Client> {
   try {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
-    if (tokens.refresh_token) { // Save only if we got a refresh token
-         await saveCredentials(oAuth2Client);
+    if (tokens.refresh_token) {
+      await saveCredentials(oAuth2Client);
     } else {
-         console.error("Did not receive refresh token. Token might expire.");
+      console.error('Did not receive refresh token. Token might expire.');
+    }
+    console.error('Authentication successful!');
+    return oAuth2Client;
+  } catch (err) {
+    console.error('Error retrieving access token', err);
+    throw new Error('Authentication failed');
+  }
+}
+
+async function authenticateWithLoopback(clientId: string, clientSecret: string): Promise<OAuth2Client> {
+  let redirectUri = '';
+  let serverClosed = false;
+  let resolveCode!: (code: string) => void;
+  let rejectCode!: (reason?: unknown) => void;
+
+  const server = createServer((req, res) => {
+    if (!req.url || !redirectUri) {
+      res.statusCode = 500;
+      res.end('OAuth handler not ready.');
+      return;
+    }
+
+    const requestUrl = new URL(req.url, redirectUri);
+    const code = requestUrl.searchParams.get('code');
+    const error = requestUrl.searchParams.get('error');
+
+    res.setHeader('Content-Type', 'text/html');
+
+    if (error) {
+      res.statusCode = 400;
+      res.end(`<html><body><h1>Authentication failed</h1><p>${error}</p></body></html>`);
+      rejectCode(new Error(`OAuth Error: ${error}`));
+      return;
+    }
+
+    if (!code) {
+      res.statusCode = 400;
+      res.end('<html><body><h1>Authentication failed</h1><p>Missing authorization code.</p></body></html>');
+      rejectCode(new Error('Missing authorization code.'));
+      return;
+    }
+
+    res.end('<html><body><h1>Authentication complete</h1><p>You may close this window.</p></body></html>');
+    resolveCode(code);
+  });
+
+  const codePromise = new Promise<string>((resolve, reject) => {
+    resolveCode = (code: string) => {
+      if (!serverClosed) {
+        serverClosed = true;
+        server.close();
+      }
+      resolve(code);
+    };
+    rejectCode = (reason?: unknown) => {
+      if (!serverClosed) {
+        serverClosed = true;
+        server.close();
+      }
+      reject(reason);
+    };
+  });
+
+  server.on('error', rejectCode);
+
+  await new Promise<void>((resolve, reject) => {
+    server.listen(0, () => resolve());
+    server.on('error', reject);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    rejectCode(new Error('Failed to determine local server address.'));
+    throw new Error('Authentication failed');
+  }
+
+  const { port } = address as AddressInfo;
+  redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
+
+  console.error(`DEBUG: Using redirect URI: ${redirectUri}`);
+  const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+
+  const authorizeUrl = oAuth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: SCOPES,
+    redirect_uri: redirectUri,
+    prompt: 'consent',
+  });
+
+  console.error('DEBUG: Generated auth URL:', authorizeUrl);
+  console.error('Authorize this app by visiting this url:', authorizeUrl);
+
+  let code: string;
+  try {
+    code = await codePromise;
+  } catch (err) {
+    console.error('Authentication flow was interrupted', err);
+    throw new Error('Authentication failed');
+  }
+
+  try {
+    const { tokens } = await oAuth2Client.getToken(code);
+    oAuth2Client.setCredentials(tokens);
+    if (tokens.refresh_token) {
+      await saveCredentials(oAuth2Client);
+    } else {
+      console.error('Did not receive refresh token. Token might expire.');
     }
     console.error('Authentication successful!');
     return oAuth2Client;
